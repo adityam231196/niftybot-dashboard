@@ -19,12 +19,24 @@ Deploy: Streamlit Cloud, with the service-account JSON stored under the
 import io
 import json
 from datetime import datetime, date, time as dtime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+
+# ---------------------------------------------------------------- timezone
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist():
+    """Current time in IST. Streamlit Cloud servers run UTC — never use
+    bare datetime.now()/date.today() anywhere in this file."""
+    return datetime.now(IST)
+
 
 # ---------------------------------------------------------------- constants
 
@@ -34,6 +46,19 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 LOT_SIZE = 65
 START_CAPITAL = 30_000          # per strategy, from May 1 2026
 CAPITAL_START_DATE = date(2026, 5, 1)
+TRACK_START = pd.Timestamp(2026, 5, 1)   # ignore trades before this
+DECISION_DATE = date(2026, 11, 30)       # go/no-go review
+
+# trade_log & exit_log headers are MISALIGNED in the sheet (header row has
+# fewer columns than data — a 'strategy' column is missing from headers).
+# These tabs MUST be read by position, never by header name.
+TRADE_LOG_COLS = ["trade_id", "strategy", "direction", "entry_date",
+                  "entry_price", "exit_date", "exit_price", "exit_type",
+                  "pnl_points", "mfe", "mae", "exit_efficiency", "_unused"]
+EXIT_LOG_COLS = ["trade_id", "strategy", "exit_date", "exit_price",
+                 "exit_type", "smi_broken", "ppst_broken", "tk_broken",
+                 "break_count", "eod_forced", "adx_at_exit", "smi_at_exit"]
+MISALIGNED_TABS = {"trade_log": TRADE_LOG_COLS, "exit_log": EXIT_LOG_COLS}
 PRICE_FLOOR, PRICE_CEIL = 150, 200
 RSI_MIN = 60
 MILESTONES = [50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000,
@@ -79,14 +104,24 @@ def load_workbook_bytes() -> bytes:
 
 @st.cache_data(ttl=60)
 def load_tabs() -> dict:
-    """Return {tab_name: DataFrame} with normalised lowercase columns."""
+    """Return {tab_name: DataFrame} with normalised lowercase columns.
+    trade_log/exit_log are read by POSITION (their header rows are
+    misaligned in the sheet — see MISALIGNED_TABS)."""
     raw = load_workbook_bytes()
     sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None, engine="openpyxl")
     out = {}
     for name, df in sheets.items():
-        df = df.copy()
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        out[name.strip().lower()] = df
+        key = name.strip().lower()
+        if key in MISALIGNED_TABS:
+            names = MISALIGNED_TABS[key]
+            df = pd.read_excel(io.BytesIO(raw), sheet_name=name,
+                               header=None, skiprows=1, engine="openpyxl")
+            df = df.iloc[:, :len(names)]
+            df.columns = names[:df.shape[1]]
+        else:
+            df = df.copy()
+            df.columns = [str(c).strip().lower() for c in df.columns]
+        out[key] = df
     return out
 
 
@@ -136,7 +171,8 @@ def inr(x):
 
 @st.cache_data(ttl=60)
 def build_datasets():
-    """Produce the tidy frames every page works from."""
+    """Produce the tidy frames every page works from.
+    All trades filtered to the tracking window (>= May 1, 2026)."""
     tabs = load_tabs()
 
     # ---- options trades: T / V28 / V29 + Pure3 merged into one frame ----
@@ -152,12 +188,21 @@ def build_datasets():
         if default_strat:
             d["strategy"] = d["strategy"].fillna(default_strat)
         tcol = col(d, "signal_time", "entry_time", "timestamp")
+        # Sheet timestamps are naive IST — parse as-is, never tz-localize
         d["signal_dt"] = to_dt(d[tcol]) if tcol else pd.NaT
+        d = d[d["signal_dt"] >= TRACK_START]          # tracking window
         d["trade_date"] = d["signal_dt"].dt.date
         for c in ["entry_option_price", "exit_option_price", "pnl_rupees",
                   "pnl_points"]:
             if c in d.columns:
                 d[c] = pd.to_numeric(d[c], errors="coerce")
+        # pure3 uses entry_price/exit_price names for its option legs
+        if "entry_option_price" not in d.columns and "entry_price" in d.columns:
+            d["entry_option_price"] = pd.to_numeric(d["entry_price"],
+                                                    errors="coerce")
+        if "exit_option_price" not in d.columns and "exit_price" in d.columns:
+            d["exit_option_price"] = pd.to_numeric(d["exit_price"],
+                                                   errors="coerce")
         for c in ["exit_reason", "entry_type", "expiry_track", "strike_type",
                   "selected_strike", "option_symbol", "is_reentry",
                   "direction"]:
@@ -169,55 +214,57 @@ def build_datasets():
     opt = (pd.concat(frames, ignore_index=True)
            if frames else pd.DataFrame())
     if not opt.empty:
-        opt["expiry_track"] = opt["expiry_track"].astype(str).str.upper()
-        opt["is_futures_only"] = opt["expiry_track"].eq("FUTURES_ONLY")
+        opt["expiry_track"] = (opt["expiry_track"].astype(str)
+                               .str.strip().str.upper())
+        # FUTURES_ONLY (or blank strike) rows are futures legs, not options
+        blank_strike = opt["selected_strike"].astype(str).str.strip() \
+            .isin(["", "nan", "None"])
+        opt["is_futures_only"] = (opt["expiry_track"].eq("FUTURES_ONLY") |
+                                  (~opt["expiry_track"]
+                                   .isin(["CURRENT_WEEK", "NEXT_WEEK"]) &
+                                   blank_strike))
         # closed option trades only, real option legs only
         opt["closed"] = opt["pnl_rupees"].notna() & ~opt["is_futures_only"]
         opt["win"] = opt["pnl_rupees"] > 0
 
-    # ---- futures trades: trade_log (T/V28/V29) + Pure3 pnl_points -------
+    # ---- futures trades --------------------------------------------------
+    # T/V28/V29: trade_log (position-mapped; pnl_points col is authoritative)
     fut_frames = []
     tl = safe_df(tabs, "trade_log")
-    if not tl.empty:
+    if not tl.empty and "strategy" in tl.columns:
         d = tl.copy()
-        sc = col(d, "strategy")
-        d["strategy"] = d[sc].map(norm_strat) if sc else np.nan
-        ec = col(d, "entry_date", "entry_time", "signal_time")
-        xc = col(d, "exit_date", "exit_time")
-        d["entry_dt"] = to_dt(d[ec]) if ec else pd.NaT
-        d["exit_dt"] = to_dt(d[xc]) if xc else pd.NaT
+        d["strategy"] = d["strategy"].map(norm_strat)
+        d["entry_dt"] = to_dt(d.get("entry_date"))
+        d["exit_dt"] = to_dt(d.get("exit_date"))
+        d = d[d["entry_dt"] >= TRACK_START]           # tracking window
         d["trade_date"] = d["entry_dt"].dt.date
-        for c in ["entry_price", "exit_price"]:
-            if c in d.columns:
-                d[c] = pd.to_numeric(d[c], errors="coerce")
-        sign = d.get("direction", pd.Series(index=d.index, dtype=object)) \
-                .astype(str).str.upper().map(
-                    lambda x: -1 if ("SHORT" in x or "SELL" in x or
-                                     x.startswith("PE") or "DOWN" in x) else 1)
-        if {"entry_price", "exit_price"} <= set(d.columns):
-            d["fut_points"] = (d["exit_price"] - d["entry_price"]) * sign
-        else:
-            d["fut_points"] = np.nan
+        d["fut_points"] = pd.to_numeric(d.get("pnl_points"), errors="coerce")
+        # fallback: derive from prices if pnl_points missing
+        ep = pd.to_numeric(d.get("entry_price"), errors="coerce")
+        xp = pd.to_numeric(d.get("exit_price"), errors="coerce")
+        sign = d.get("direction").astype(str).str.upper().map(
+            lambda x: -1 if x.startswith("PE") else 1)
+        d["fut_points"] = d["fut_points"].fillna((xp - ep) * sign)
         d["fut_rupees"] = d["fut_points"] * LOT_SIZE
         d["exit_type"] = d.get("exit_type", np.nan)
         fut_frames.append(d[["strategy", "trade_date", "entry_dt", "exit_dt",
                              "fut_points", "fut_rupees", "exit_type"]])
 
-    p3 = safe_df(tabs, "pure3_trade_log")
-    if not p3.empty and "pnl_points" in p3.columns:
-        d = p3.copy()
-        tcol = col(d, "signal_time", "entry_time", "timestamp")
-        d["entry_dt"] = to_dt(d[tcol]) if tcol else pd.NaT
-        d["trade_date"] = d["entry_dt"].dt.date
-        d["fut_points"] = pd.to_numeric(d["pnl_points"], errors="coerce")
-        d["fut_rupees"] = d["fut_points"] * LOT_SIZE
-        d["strategy"] = "PURE3"
-        d["exit_dt"] = pd.NaT
-        d["exit_type"] = d.get("exit_reason", np.nan)
-        # one futures row per signal (avoid double count across option legs)
-        d = d.drop_duplicates(subset=["entry_dt"])
-        fut_frames.append(d[["strategy", "trade_date", "entry_dt", "exit_dt",
-                             "fut_points", "fut_rupees", "exit_type"]])
+    # Pure3 futures: FUTURES_ONLY rows of pure3_trade_log.
+    # Their pnl_rupees ALREADY includes the x65 — use directly.
+    if not opt.empty:
+        p3f = opt[(opt["strategy"] == "PURE3") & opt["is_futures_only"] &
+                  opt["pnl_rupees"].notna()].copy()
+        if not p3f.empty:
+            p3f["fut_rupees"] = p3f["pnl_rupees"]
+            p3f["fut_points"] = pd.to_numeric(p3f.get("pnl_points"),
+                                              errors="coerce")
+            p3f["entry_dt"] = p3f["signal_dt"]
+            p3f["exit_dt"] = pd.NaT
+            p3f["exit_type"] = p3f["exit_reason"]
+            fut_frames.append(p3f[["strategy", "trade_date", "entry_dt",
+                                   "exit_dt", "fut_points", "fut_rupees",
+                                   "exit_type"]])
 
     fut = (pd.concat(fut_frames, ignore_index=True)
            if fut_frames else pd.DataFrame())
@@ -505,6 +552,11 @@ def page_overview(opt, daily_opt, daily_fut):
 
     # today / latest day PnL
     last_day = daily_opt.index.max()
+    today = now_ist().date()
+    if (last_day < today and today.weekday() < 5
+            and now_ist().hour < 16):
+        st.info("Today's EOD run not yet logged — the sheet updates "
+                "after ~3:45 PM IST on trading days.")
     st.subheader(f"Latest trading day: {last_day}")
     c1, c2 = st.columns(2)
     with c1:
@@ -550,11 +602,11 @@ def page_daily_log(daily_opt, daily_fut, other):
 
     edl = other.get("entry_decision_log", pd.DataFrame())
     if not edl.empty:
-        tc = col(edl, "timestamp", "signal_time")
+        tc = col(edl, "date", "timestamp", "signal_time")
         if tc:
             e = edl.copy()
             e["d"] = to_dt(e[tc]).dt.date
-            rc = col(e, "result")
+            rc = col(e, "skip_reason", "result")
             if rc:
                 st.subheader("Signals per day (entry_decision_log)")
                 pivot = (e.groupby(["d", rc]).size().unstack(fill_value=0)
@@ -714,7 +766,7 @@ def page_signal_detail(opt, other):
     dates = set()
     if not opt.empty:
         dates |= set(opt["trade_date"].dropna())
-    tc = col(edl, "timestamp", "signal_time") if not edl.empty else None
+    tc = col(edl, "date", "timestamp", "signal_time") if not edl.empty else None
     if tc:
         edl = edl.copy()
         edl["d"] = to_dt(edl[tc]).dt.date
@@ -835,7 +887,10 @@ def main():
         st.cache_data.clear()
         st.rerun()
     st.sidebar.caption(f"Sheet re-read every 60s · "
-                       f"{datetime.now():%d %b %Y %H:%M}")
+                       f"{now_ist():%d %b %Y %H:%M} IST")
+    days_left = (DECISION_DATE - now_ist().date()).days
+    st.sidebar.caption(f"🎯 Go/no-go decision: {days_left} days "
+                       f"(Nov 30, 2026)")
 
     try:
         opt, fut, daily_opt, daily_fut, other = build_datasets()
