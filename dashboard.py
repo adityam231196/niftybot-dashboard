@@ -55,6 +55,8 @@ def _drive_service():
     from googleapiclient.discovery import build
 
     info = dict(st.secrets["gcp_service_account"])
+    if "private_key" in info:
+        info["private_key"] = info["private_key"].replace("\\n", "\n").replace("\r\n", "\n")
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
     return build("drive", "v3", credentials=creds, cache_discovery=False)
